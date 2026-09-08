@@ -1,80 +1,74 @@
-# Radmin VPN (蓝盾) 联机体检工具 + 组网方案推荐
+# NetCheck — 联机体检工具 v0.2 (蓝盾/Radmin VPN 玩家向)
 
-一套帮你诊断"联机一格信号"问题的开源小工具：
-检测蓝盾（Radmin VPN）链路质量，并进一步**体检你的整个网络环境（NAT/CGNAT/IPv6）**，自动推荐适合你的组网方案。
+一套帮你诊断"联机一格信号"问题的开源小工具：检测蓝盾（Radmin VPN）链路 + 体检整个网络环境（NAT/CGNAT/IPv6），
+输出**"现在怎样 → 依据是什么 → 下一步做什么"**的报告。默认只读，不修改系统设置。
 
-> 蓝盾 = Radmin VPN：Radmin 的图标是蓝色盾牌，中文社区习惯叫它"蓝盾"，常用于 Minecraft 等游戏的虚拟局域网联机。
+> 蓝盾 = Radmin VPN：Radmin 图标是蓝色盾牌，中文社区习惯叫"蓝盾"，常用于 Minecraft 等游戏联机。
 
 ## 为什么会有"一格信号"？
 
-Radmin VPN 是 P2P 虚拟局域网：理想情况下双方**直连**（国内跨省通常 30~150ms）；
-但如果 NAT 打洞失败（手机热点/USB 共享双重 NAT、运营商大内网、跨运营商、防火墙拦入站等），
-Radmin 会自动把流量**甩到官方中继服务器**兜底——而中继节点常在**境外（如欧洲 OVH）**，
-延迟飙到 500ms~2000ms+，游戏里就显示"一格信号"。
+Radmin 是 P2P 虚拟局域网：双方能直连时国内跨省通常 30~150ms；一旦 NAT 打洞失败（手机热点/USB 共享双重 NAT、
+运营商大内网、跨运营商、防火墙拦入站、代理/TUN 劫持等），流量会被甩到官方中继服务器兜底——中继常在**境外（欧洲 OVH）**，
+延迟 500~2000ms+，游戏里就是"一格信号"。
 
-实测数据（湖南↔浙江）：
+实测数据（湖南电信 ↔ 浙江移动）：直连成功 59ms ✅；打洞失败走欧洲中继 465~1100ms（最大 2013ms）❌；
+双方 IPv6 直连 145ms ✅；防火墙放行+双方重启后从 512ms 拉回 66ms（但会反复横跳）。
 
-| 场景 | 延迟 |
-|---|---|
-| 蓝盾直连成功 | 平均 59ms ✅ |
-| 打洞失败走欧洲中继 | 平均 465~1100ms，最大 2013ms ❌ |
-| 双方 IPv6 直连（不经组网工具） | 145ms ✅ |
-| 防火墙放行+双方重启后 | 从 512ms 拉回 66ms（会反复横跳） |
-
-## 工具一：NetCheck（联机方案体检+推荐）【推荐】
-
-`NetCheck.ps1` / `NetCheck.bat` —— 双击即用，输出 6 段报告：
-
-1. **蓝盾现状**：服务/网卡/虚拟 IP + 到同伴的实测延迟
-2. **上网链路与 NAT 环境**：识别手机共享/移动网卡、CGNAT（100.64.0.0/10）、运营商风险（移动宽带是组网重灾区）
-3. **STUN NAT 类型探测**：向公共 STUN 服务器询问"你看到的我的出口"，判断锥形/对称型 NAT、多层 NAT/CGNAT
-4. **IPv6 检测**：有无公网 IPv6 + 连通性（IPv6 是国内组网最稳的直连通路）
-5. **防火墙放行检查**：蓝盾入站规则是否就位
-6. **推荐方案排序**：根据检测结果自动排序（EasyTier / ZeroTier / 蓝盾 / UU局域网）
+## 快速开始
 
 ```powershell
-# 普通体检(无需管理员): 双击 NetCheck.bat
-# 修复蓝盾防火墙(需管理员):
-pwsh -NoProfile -ExecutionPolicy Bypass -File NetCheck.ps1 -Fix
+# 普通体检(无需管理员): 双击 NetCheck.bat → 输出摘要式报告 + 自动保存三份文件
+# 手动指定朋友IP / 朋友IPv6:
+pwsh -File NetCheck.ps1 -PeerIP 26.x.x.x -PeerIPv6 2409:xxxx
+# 两端报告对照(双方各跑一次后):
+pwsh -File NetCheck.ps1 -Compare 朋友的NetCheck-Report-*.json
+# 修复模式(需管理员; 先预览再执行; -Force 跳过确认):
+pwsh -File NetCheck.ps1 -Fix
+# 撤销本工具做过的修改:
+pwsh -File NetCheck.ps1 -Undo
 ```
 
-参数：`-PeerIP '26.x.x.x'`（手动指定朋友IP）、`-PingCount 10`、`-SkipGeo`
+## 报告文件（自动保存）
 
-### 判定标准
-
-| 平均延迟 | 判定 |
+| 文件 | 用途 |
 |---|---|
-| < 150ms | 直连良好 ✅ |
-| 150 ~ 300ms | 一般，可玩但可能略卡 |
-| > 300ms | 疑似境外中继 ⚠️ |
+| `NetCheck-Report-*.txt` | 便于阅读的完整报告 |
+| `NetCheck-Report-*.json` | 便于分析的完整数据 |
+| `NetCheck-Share-*.json` | **脱敏分享版**（隐藏完整 IP/设备名，保留判定与测量数据）→ 发朋友/评论区用这个 |
 
-### 方案选择速查
+## 检测与判定原则（可靠性优先）
 
-- 有可用 IPv6 → **EasyTier / ZeroTier**（走 IPv6 直连，成功率最高）
-- 移动宽带 / CGNAT / 对称型 NAT → **EasyTier（公共节点/自建）或 UU局域网**（中转兜底）
-- 电信联通锥形 NAT → **蓝盾 / ZeroTier** 都有机会直连
-- 不想折腾 → **网易UU加速器「局域网联机」**，免费零配置
-
-## 工具二：RadminCheck（蓝盾专用体检）
-
-老版本工具，只针对蓝盾做链路体检（蓝盾状态/同伴发现/延迟/中继服务器定位/防火墙）。
-
-```powershell
-# 双击 RadminCheck.bat
-pwsh -NoProfile -ExecutionPolicy Bypass -File RadminCheck.ps1 -Fix   # 修复模式
-```
-
-## 文档：组网方案横评
-
-`net-solutions-comparison.md`：蓝盾 / ZeroTier / Tailscale / EasyTier / UU局域网 五方案对比、
-选择流程图、实测数据、评论区常见问题解答（同步自 B 站专栏初稿）。
+- **NAT 探测**：同一本地 UDP 端点访问多个 STUN 服务器，只报告实测映射行为；证据不足就明确说"未确定"，不猜测
+- **中继判定**："高延迟"与"疑似中继"分开——高延迟 + 境外连接证据 = 疑似中继；无证据 = 原因未确认
+- **IPv6 三项**：本机地址 / 外网连通 / 与朋友连通（-PeerIPv6），不做"双方可直连"的无据推断
+- **失败分类**：超时 / 不可达 / 响应数据异常 / 程序错误，不统一甩锅"网络受限"
+- **修复可撤销**：-Fix 先预览、只改蓝盾虚拟网卡、规则带 `NetCheck-Radmin-` 前缀并记录状态文件；-Undo 只撤销本工具的改动，逐项复核后才报告结果
 
 ## 兼容性
 
-- Windows 10/11，PowerShell 5.1 或 7+
-- 体检为只读操作（无需管理员）；`-Fix` 模式需要管理员
-- STUN/IP 归属查询为尽力而为：网络受限时自动跳过，不影响主要结论
+- Windows 10/11，PowerShell 5.1 / 7+
+- 只读体检无需管理员；-Fix / -Undo 需管理员
+- 测试：`pwsh -File tests\NetCheck.Tests.ps1`（纯函数单元测试，无需 Pester）
+
+## 项目文件
+
+| 文件 | 说明 |
+|---|---|
+| `NetCheck.ps1` / `NetCheck.bat` | 主工具（双击即用） |
+| `RadminCheck.ps1` / `RadminCheck.bat` | v0.1 蓝盾专用体检（保留） |
+| `net-solutions-comparison.md` | 五方案横评：蓝盾/ZeroTier/Tailscale/EasyTier/UU局域网 |
+| `tests/NetCheck.Tests.ps1` | 单元测试 |
+| `CHANGELOG.md` | 版本记录 |
+| `FEEDBACK.md` | 反馈模板 + 案例记录（含 B 站社区案例） |
+| `README_EN.md` | English intro |
+| `LICENSE` | MIT |
+
+## 反馈与社区
+
+- 反馈模板与案例记录见 [FEEDBACK.md](FEEDBACK.md)
+- 社区讨论帖：https://www.bilibili.com/opus/1244434707826868232
+- 第三方方案（UU局域网/EasyTier 等）免费政策以官方页面为准，核实于 2026-09
 
 ## 免责声明
 
-本工具仅做网络诊断与信息收集，不修改游戏文件，不涉及账号数据。
+本工具仅做网络诊断与信息收集；`-Fix` 仅修改蓝盾虚拟网卡类型与带前缀的防火墙规则（可撤销）。不修改游戏文件、不涉及账号数据。
