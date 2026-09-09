@@ -25,7 +25,7 @@ param(
     [switch]$SkipGeo,
     [switch]$NoSave
 )
-$ScriptVersion = '0.2.0'
+$ScriptVersion = '0.2.1'
 $ErrorActionPreference = 'SilentlyContinue'
 $adapterName = 'Radmin VPN'
 $rulePrefix = 'NetCheck-Radmin-'
@@ -50,16 +50,20 @@ function Info($m) { Emit ('  [i]   ' + $m) DarkGray }
 
 # ================= 纯函数(可单元测试) =================
 function ConvertTo-StunMapped {
-    param([byte[]]$Resp, [string]$Server = '')
+    param([byte[]]$Resp, [string]$Server = '', [byte[]]$Tid = $null)
     # 解析 STUN Binding 响应, 返回 MappedIP/MappedPort; 非法返回 $null
     if (-not $Resp -or $Resp.Length -lt 20) { return $null }
     $t = ([int]$Resp[0] -shl 8) -bor [int]$Resp[1]
     if ($t -ne 0x0101) { return $null }
     if (-not ($Resp[4] -eq 0x21 -and $Resp[5] -eq 0x12 -and $Resp[6] -eq 0xA4 -and $Resp[7] -eq 0x42)) { return $null }
+    if ($Tid -and $Tid.Length -eq 12) {
+        for ($k = 0; $k -lt 12; $k++) { if ($Resp[8 + $k] -ne $Tid[$k]) { return $null } }
+    }
     $i = 20
     while ($i -lt ($Resp.Length - 3)) {
         $type = ([int]$Resp[$i] -shl 8) -bor [int]$Resp[$i + 1]
         $alen = ([int]$Resp[$i + 2] -shl 8) -bor [int]$Resp[$i + 3]
+        if (($i + 4 + $alen) -gt $Resp.Length) { break }   # 属性声称长度超出报文实际长度 → 截断报文, 丢弃
         if (($type -eq 0x0001 -or $type -eq 0x0020) -and $alen -ge 8 -and $Resp[$i + 5] -eq 0x01) {
             $port = ([int]$Resp[$i + 6] -shl 8) -bor [int]$Resp[$i + 7]
             $b = New-Object byte[] 4
@@ -77,13 +81,78 @@ function ConvertTo-StunMapped {
     return $null
 }
 
+function Get-PingStats {
+    param([object[]]$Replies)
+    # 兼容 PS5.1(ResponseTime) 与 PS7(Latency/Status), 按成功状态统计
+    $ok = 0; $lats = @()
+    foreach ($rp in $Replies) {
+        if (-not $rp) { continue }
+        $success = $true
+        if ($rp.PSObject.Properties['Status']) { $success = ($rp.Status -eq 'Success') }
+        $lat = $null
+        if ($rp.PSObject.Properties['Latency'] -and $null -ne $rp.Latency) { $lat = $rp.Latency }
+        elseif ($rp.PSObject.Properties['ResponseTime'] -and $null -ne $rp.ResponseTime) { $lat = $rp.ResponseTime }
+        if ($success -and $null -ne $lat) { $ok++; $lats += [double]$lat }
+    }
+    $total = @($Replies).Count
+    if ($ok -eq 0) { return [pscustomobject]@{ Ok = 0; Total = $total; Avg = $null; Min = $null; Max = $null; Loss = $total } }
+    $m = $lats | Measure-Object -Average -Minimum -Maximum
+    return [pscustomobject]@{ Ok = $ok; Total = $total; Avg = [math]::Round($m.Average, 1); Min = $m.Minimum; Max = $m.Maximum; Loss = $total - $ok }
+}
+
 function Get-LatencyVerdict {
-    param([double]$AvgMs, [int]$LossCount, [int]$TotalCount)
-    if ($TotalCount -le 0) { return 'UNREACHABLE' }
-    if ($LossCount -ge [math]::Ceiling($TotalCount / 2.0)) { return 'UNSTABLE_LOSSY' }
-    if ($AvgMs -lt 150) { return 'GOOD' }
-    if ($AvgMs -lt 300) { return 'FAIR' }
+    param($AvgMs)
+    # 仅评价延迟, 丢包由 Get-LossVerdict 单独评价
+    if ($null -eq $AvgMs -or "$AvgMs" -eq '') { return 'UNKNOWN' }
+    $v = [double]$AvgMs
+    if ($v -lt 150) { return 'GOOD' }
+    if ($v -lt 300) { return 'FAIR' }
     return 'POOR'
+}
+
+function Get-LossVerdict {
+    param([int]$LossCount, [int]$TotalCount)
+    if ($TotalCount -le 0 -or $LossCount -le 0) { return 'NONE' }
+    if ($LossCount -gt [math]::Floor($TotalCount * 0.2)) { return 'HEAVY' }
+    return 'MILD'
+}
+
+function Merge-ChangeList {
+    param([object[]]$Existing, [object[]]$New)
+    # 合并改动记录: 同一(Kind+Target)只保留第一次记录, 保住最初修改前的状态
+    $list = @($Existing)
+    foreach ($n in $New) {
+        $dup = $false
+        foreach ($e in $list) { if ($e.Kind -eq $n.Kind -and "$($e.Target)" -eq "$($n.Target)") { $dup = $true; break } }
+        if (-not $dup) { $list += $n }
+    }
+    return $list
+}
+
+function Expand-Changes {
+    param($Items)
+    # 防御性扁平化: 兼容旧版可能产生的嵌套结构, 保证每项都是单个改动对象
+    $flat = @()
+    foreach ($it in @($Items)) {
+        if (-not $it) { continue }
+        if ($it.PSObject.Properties['Kind']) { $flat += $it }
+        else { $flat += @(Expand-Changes -Items $it) }
+    }
+    return $flat
+}
+
+function ConvertTo-CompareSource {
+    param($Obj)
+    # 兼容完整报告(数据在 facts 下)与分享报告(数据在顶层)
+    if (-not $Obj) { return $null }
+    if ($Obj.PSObject.Properties['facts']) { return $Obj.facts }
+    return $Obj
+}
+
+function Get-Val {
+    param($Src, [string]$Name)
+    if (-not $Src -or -not $Src.PSObject.Properties[$Name]) { return '数据缺失' }
+    return "$($Src.$Name)"
 }
 
 function Get-NatVerdict {
@@ -103,7 +172,6 @@ function Get-RelayVerdict {
         if ($HasForeignConn) { return 'RELAY_SUSPECTED' }
         return 'POOR_UNCONFIRMED'
     }
-    if ($LatencyVerdict -eq 'UNSTABLE_LOSSY') { return 'LOSSY' }
     return 'NONE'
 }
 
@@ -143,6 +211,9 @@ function Get-Recommendations {
     if ($Facts.Tether) {
         $rec += '当前为手机热点/USB共享(双重NAT): 换宽带直连能提高任何方案的稳定性(依据: 网卡类型)'
     }
+    if ($Facts.LossVerdict -eq 'MILD' -or $Facts.LossVerdict -eq 'HEAVY') {
+        $rec += "存在丢包 $($Facts.LossCount)/$($Facts.TotalPings): 先排查无线干扰/代理劫持/网线, 丢包比高延迟更影响游戏手感(依据: 实测丢包)"
+    }
     if ($rec.Count -eq 0) {
         $rec += '未发现明显风险项: 当前方案可继续使用, 若仍卡顿请与朋友对照报告(依据: 本机各项检测正常)'
     }
@@ -155,7 +226,7 @@ function Main {
     $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
     $facts = @{
         Version = $ScriptVersion; Generated = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        LatencyVerdict = 'UNREACHABLE'; RelayVerdict = 'NONE'; PeerIp = $PeerIP
+        LatencyVerdict = 'UNKNOWN'; LossVerdict = 'NONE'; RelayVerdict = 'NONE'; PeerIp = $PeerIP
         AvgMs = $null; MinMs = $null; MaxMs = $null; LossCount = 0; TotalPings = 0
         NatType = 'UNDETERMINED'; NatReason = ''; StunOk = 0; StunFail = 0; StunDetail = @()
         LocalV6 = $false; V6ExtOk = $false; PeerV6Ok = ''; V6Addrs = @()
@@ -185,15 +256,10 @@ function Main {
         $facts.PeerIp = $p
         $r = @(Test-Connection -ComputerName $p -Count $PingCount -ErrorAction SilentlyContinue)
         $facts.TotalPings = $PingCount
-        if ($r.Count -gt 0) {
-            $m = $r | Measure-Object ResponseTime -Average -Minimum -Maximum
-            $facts.AvgMs = [math]::Round($m.Average, 1); $facts.MinMs = $m.Minimum; $facts.MaxMs = $m.Maximum
-            $facts.LossCount = $PingCount - $r.Count
-            $pingResults += [pscustomobject]@{ Peer = $p; Avg = $facts.AvgMs; Min = $facts.MinMs; Max = $facts.MaxMs; Loss = $facts.LossCount }
-        } else {
-            $facts.LossCount = $PingCount
-            $pingResults += [pscustomobject]@{ Peer = $p; Avg = $null; Min = $null; Max = $null; Loss = $PingCount }
-        }
+        $st = Get-PingStats -Replies $r
+        $facts.AvgMs = $st.Avg; $facts.MinMs = $st.Min; $facts.MaxMs = $st.Max
+        $facts.LossCount = $st.Loss
+        $pingResults += [pscustomobject]@{ Peer = $p; Avg = $st.Avg; Min = $st.Min; Max = $st.Max; Loss = $st.Loss; Ok = $st.Ok }
     }
 
     # ---- 上网链路 ----
@@ -246,7 +312,7 @@ function Main {
                 else { $st = 'ERROR' }
             }
             if ($st -eq 'OK' -and $resp) {
-                $m = ConvertTo-StunMapped -Resp $resp -Server $srv
+                $m = ConvertTo-StunMapped -Resp $resp -Server $srv -Tid $req[8..19]
                 if ($m) { $stun += [pscustomobject]@{ Server = $srv; Status = 'OK'; MappedIP = $m.MappedIP; MappedPort = $m.MappedPort }; $facts.StunOk++ }
                 else { $stun += [pscustomobject]@{ Server = $srv; Status = 'BAD_DATA'; MappedIP = ''; MappedPort = 0 }; $facts.StunFail++ }
             } else {
@@ -295,23 +361,28 @@ function Main {
         }
     }
     $facts.ForeignConns = $foreign
-    $facts.LatencyVerdict = Get-LatencyVerdict -AvgMs ([double]$facts.AvgMs) -LossCount $facts.LossCount -TotalCount $facts.TotalPings
+    $facts.LatencyVerdict = Get-LatencyVerdict -AvgMs $facts.AvgMs
+    $facts.LossVerdict = Get-LossVerdict -LossCount $facts.LossCount -TotalCount $facts.TotalPings
     $facts.RelayVerdict = Get-RelayVerdict -LatencyVerdict $facts.LatencyVerdict -HasForeignConn $facts.HasForeignConn
     $recs = Get-Recommendations -Facts $facts
 
     # ================= 输出: 摘要优先 =================
-    $title = switch ($facts.LatencyVerdict) {
-        'UNREACHABLE'    { '与朋友的连接当前无法测试' }
-        'UNSTABLE_LOSSY' { '与朋友的连接不稳定(丢包严重)' }
-        'GOOD'           { '与朋友的连接良好' }
-        'FAIR'           { '与朋友的连接一般' }
-        'POOR'           { if ($facts.RelayVerdict -eq 'RELAY_SUSPECTED') { '与朋友的连接不稳定, 疑似经过中继' } else { '与朋友的连接不稳定(原因尚未确认)' } }
+    $title = '与朋友的连接当前无法测试'
+    if ($facts.TotalPings -gt 0 -and $facts.AvgMs) {
+        if ($facts.LossVerdict -eq 'HEAVY') { $title = '与朋友的连接不稳定(丢包严重)' }
+        elseif ($facts.LatencyVerdict -eq 'POOR') {
+            $title = if ($facts.RelayVerdict -eq 'RELAY_SUSPECTED') { '与朋友的连接不稳定, 疑似经过中继' } else { '与朋友的连接不稳定(原因尚未确认)' }
+        }
+        elseif ($facts.LatencyVerdict -eq 'FAIR') { $title = '与朋友的连接一般' }
+        elseif ($facts.LossVerdict -eq 'MILD') { $title = '与朋友的连接良好, 但存在丢包' }
+        else { $title = '与朋友的连接良好' }
     }
     Section "本次检测: $title  (NetCheck v$ScriptVersion)"
     Emit '【已测到】'
     if ($facts.TotalPings -gt 0) {
         if ($facts.AvgMs) { Emit "  • 到朋友 $($facts.PeerIp) : $($facts.TotalPings) 次探测, 平均 $($facts.AvgMs)ms (最小 $($facts.MinMs)ms / 最大 $($facts.MaxMs)ms), 丢包 $($facts.LossCount)" }
         else { Emit "  • 到朋友 $($facts.PeerIp) : $($facts.TotalPings) 次探测全部超时/不通" }
+        if ($facts.LossVerdict -ne 'NONE') { Emit "  • 丢包评价: $($facts.LossVerdict) (丢包比高延迟更影响游戏手感)" }
     } else { Emit '  • 未找到在线的朋友(可加 -PeerIP 手动指定)' }
     if ($facts.RadminInstalled) { Emit '  • 蓝盾(Radmin VPN)已安装, 服务正常' } else { Emit '  • 本机未安装蓝盾(Radmin VPN)' }
     if ($facts.UplinkDesc) { Emit "  • 上网链路: $($facts.UplinkDesc)" }
@@ -348,8 +419,9 @@ function Main {
         if ($pr.Avg) { Emit "  $($pr.Peer) : 平均 $($pr.Avg)ms / 最小 $($pr.Min)ms / 最大 $($pr.Max)ms / 丢包 $($pr.Loss)/$PingCount" }
         else { Emit "  $($pr.Peer) : 全部超时/不通 (丢包 $($pr.Loss)/$PingCount)" }
     }
-    $lvText = @{ GOOD = '良好(<150ms)'; FAIR = '一般(150~300ms)'; POOR = '高延迟(>300ms)'; UNSTABLE_LOSSY = '丢包严重'; UNREACHABLE = '不可达' }[$facts.LatencyVerdict]
-    Emit "  判定: $lvText"
+    $lvText = @{ GOOD = '良好(<150ms)'; FAIR = '一般(150~300ms)'; POOR = '高延迟(>300ms)'; UNKNOWN = '无有效探测数据' }[$facts.LatencyVerdict]
+    $lossText = @{ NONE = '无丢包'; MILD = '轻微丢包'; HEAVY = '丢包严重' }[$facts.LossVerdict]
+    Emit "  延迟判定: $lvText | 丢包判定: $lossText ($($facts.LossCount)/$($facts.TotalPings))"
     if ($facts.RelayVerdict -eq 'RELAY_SUSPECTED') { Bad '高延迟 + 存在境外控制/中继连接 → 疑似中继(证据如下, 非100%确认)' }
     elseif ($facts.RelayVerdict -eq 'POOR_UNCONFIRMED') { Warn '高延迟但未抓到中继连接证据 → 不认定已走中继' }
     if ($facts.HasForeignConn) {
@@ -407,7 +479,7 @@ function Main {
             $share = [ordered]@{
                 tool = 'NetCheck'; version = $ScriptVersion; generated = $facts.Generated
                 peerIp = Mask-Ip $facts.PeerIp; avgMs = $facts.AvgMs; minMs = $facts.MinMs; maxMs = $facts.MaxMs
-                loss = $facts.LossCount; totalPings = $facts.TotalPings; latencyVerdict = $facts.LatencyVerdict; relayVerdict = $facts.RelayVerdict
+                loss = $facts.LossCount; totalPings = $facts.TotalPings; latencyVerdict = $facts.LatencyVerdict; lossVerdict = $facts.LossVerdict; relayVerdict = $facts.RelayVerdict
                 natType = $facts.NatType; natReason = $facts.NatReason; stunOk = $facts.StunOk; stunFail = $facts.StunFail
                 localV6 = $facts.LocalV6; v6ExtOk = $facts.V6ExtOk; peerV6Ok = $facts.PeerV6Ok
                 isCgnat = $facts.IsCgnat; isMobileIsp = $facts.IsMobileIsp; tether = $facts.Tether
@@ -437,14 +509,20 @@ function Invoke-Fix {
         $ans = Read-Host '确认执行? (Y=执行, 其他=取消)'
         if ($ans -ne 'Y') { Emit '已取消, 未做任何修改'; return }
     }
-    $state = @{ AppliedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Changes = @() }
+    $outDir = if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }
+    $statePath = Join-Path $outDir 'NetCheck.state.json'
+    $oldChanges = @()
+    if (Test-Path $statePath) {
+        try { $old = Get-Content -Raw -Encoding UTF8 $statePath | ConvertFrom-Json; $oldChanges = @($old.Changes) } catch { Warn '旧状态文件无法读取, 将重建记录' }
+    }
+    $newChanges = @()
     $allOk = $true
     $prof = Get-NetConnectionProfile -InterfaceAlias $adapterName -ErrorAction SilentlyContinue
     $prevCat = if ($prof) { "$($prof.NetworkCategory)" } else { 'UNKNOWN' }
     if ($prof) {
         Set-NetConnectionProfile -InterfaceAlias $adapterName -NetworkCategory Private -ErrorAction SilentlyContinue
         $after = Get-NetConnectionProfile -InterfaceAlias $adapterName -ErrorAction SilentlyContinue
-        if ($after -and $after.NetworkCategory -eq 'Private') { Ok "虚拟网卡已设为专用(原为 $prevCat)"; $state.Changes += [pscustomobject]@{ Kind = 'Profile'; Target = $adapterName; Previous = $prevCat } }
+        if ($after -and $after.NetworkCategory -eq 'Private') { Ok "虚拟网卡已设为专用(原为 $prevCat)"; $newChanges += [pscustomobject]@{ Kind = 'Profile'; Target = $adapterName; Previous = $prevCat } }
         else { Bad '虚拟网卡设置失败或未生效'; $allOk = $false }
     } else { Warn '未找到蓝盾网卡的网络配置文件, 跳过此步' }
     foreach ($item in @(
@@ -455,32 +533,36 @@ function Invoke-Fix {
             if (-not $exists) {
                 New-NetFirewallRule -DisplayName $item.Name -Direction Inbound -Action Allow -Program $item.Path -Profile Any -ErrorAction SilentlyContinue | Out-Null
                 $verify = Get-NetFirewallRule -DisplayName $item.Name -ErrorAction SilentlyContinue
-                if ($verify -and $verify.Enabled) { Ok "规则已创建并生效: $($item.Name)"; $state.Changes += [pscustomobject]@{ Kind = 'Rule'; Target = $item.Name; Previous = '' } }
+                if ($verify -and $verify.Enabled) { Ok "规则已创建并生效: $($item.Name)"; $newChanges += [pscustomobject]@{ Kind = 'Rule'; Target = $item.Name; Previous = '' } }
                 else { Bad "规则创建失败: $($item.Name)"; $allOk = $false }
             } else { Info "规则已存在: $($item.Name) (未重复创建)" }
         } else { Bad "找不到程序: $($item.Path)"; $allOk = $false }
     }
-    $statePath = Join-Path (if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }) 'NetCheck.state.json'
-    try { $state | ConvertTo-Json -Depth 5 | Out-File -FilePath $statePath -Encoding UTF8; Info "改动已记录: $statePath" } catch { Warn '状态文件写入失败(撤销功能会受限)' }
+    $state = @{ AppliedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Changes = @(Merge-ChangeList -Existing $oldChanges -New $newChanges) }
+    try { $state | ConvertTo-Json -Depth 5 | Out-File -FilePath $statePath -Encoding UTF8; Info "改动已记录: $statePath (历史 $($oldChanges.Count) 项 + 本次 $($newChanges.Count) 项)" } catch { Warn '状态文件写入失败(撤销功能会受限)' }
     if ($allOk) { Ok '修复完成(以上各项均已复核生效)' } else { Bad '部分操作失败, 请查看上方每项的实际结果(不会假报完成)' }
 }
 
 function Invoke-Undo {
     Section '撤销模式(仅撤销本工具做过的修改)'
-    $statePath = Join-Path (if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }) 'NetCheck.state.json'
+    $outDir = if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }
+    $statePath = Join-Path $outDir 'NetCheck.state.json'
     if (-not (Test-Path $statePath)) { Warn '没有本工具的状态文件 → 没有可撤销的本工具改动(不会动其他规则)'; return }
     try { $state = Get-Content -Raw -Encoding UTF8 $statePath | ConvertFrom-Json } catch { Bad "状态文件损坏: $($_.Exception.Message)"; return }
+    $flat = @(Expand-Changes -Items $state.Changes)
+    if ($flat.Count -eq 0) { Warn '状态文件里没有可撤销的改动'; Remove-Item $statePath -Force -ErrorAction SilentlyContinue; return }
     $allOk = $true
-    foreach ($c in $state.Changes) {
-        if ($c.Kind -eq 'Rule') {
-            $ru = Get-NetFirewallRule -DisplayName $c.Target -ErrorAction SilentlyContinue
-            if ($ru) { $ru | Remove-NetFirewallRule -ErrorAction SilentlyContinue; $chk = Get-NetFirewallRule -DisplayName $c.Target -ErrorAction SilentlyContinue; if (-not $chk) { Ok "已删除规则: $($c.Target)" } else { Bad "规则删除失败: $($c.Target)"; $allOk = $false } }
-            else { Info "规则不存在(可能已手动删除): $($c.Target)" }
+    foreach ($c in $flat) {
+        $kind = "$($c.Kind)"; $target = "$($c.Target)"; $prev = "$($c.Previous)"
+        if ($kind -eq 'Rule') {
+            $ru = Get-NetFirewallRule -DisplayName $target -ErrorAction SilentlyContinue
+            if ($ru) { $ru | Remove-NetFirewallRule -ErrorAction SilentlyContinue; $chk = Get-NetFirewallRule -DisplayName $target -ErrorAction SilentlyContinue; if (-not $chk) { Ok "已删除规则: $target" } else { Bad "规则删除失败: $target"; $allOk = $false } }
+            else { Info "规则不存在(可能已手动删除): $target" }
         }
-        elseif ($c.Kind -eq 'Profile' -and $c.Previous -ne 'UNKNOWN') {
-            Set-NetConnectionProfile -InterfaceAlias $c.Target -NetworkCategory $c.Previous -ErrorAction SilentlyContinue
-            $after = Get-NetConnectionProfile -InterfaceAlias $c.Target -ErrorAction SilentlyContinue
-            if ($after -and $after.NetworkCategory -eq $c.Previous) { Ok "已恢复网卡类型: $($c.Target) → $($c.Previous)" } else { Bad "网卡类型恢复失败: $($c.Target)"; $allOk = $false }
+        elseif ($kind -eq 'Profile' -and $prev -ne 'UNKNOWN') {
+            Set-NetConnectionProfile -InterfaceAlias $target -NetworkCategory $prev -ErrorAction SilentlyContinue
+            $after = Get-NetConnectionProfile -InterfaceAlias $target -ErrorAction SilentlyContinue
+            if ($after -and $after.NetworkCategory -eq $prev) { Ok "已恢复网卡类型: $target → $prev" } else { Bad "网卡类型恢复失败: $target"; $allOk = $false }
         }
     }
     if ($allOk) { Remove-Item $statePath -Force -ErrorAction SilentlyContinue; Ok '撤销完成, 状态文件已清除' } else { Bad '部分撤销失败, 请查看上方明细' }
@@ -491,27 +573,40 @@ function Invoke-Compare {
     if (-not (Test-Path $Compare)) { Bad "找不到对照文件: $Compare"; return }
     try { $o = Get-Content -Raw -Encoding UTF8 $Compare | ConvertFrom-Json } catch { Bad "对照文件解析失败: $($_.Exception.Message)"; return }
     if ($o.tool -ne 'NetCheck') { Warn '对照文件不是 NetCheck 报告(仅支持同工具JSON)' }
+    $osrc = ConvertTo-CompareSource -Obj $o
+    $oAvg = Get-Val $osrc 'avgMs'; if ($oAvg -ne '数据缺失') { $oAvg = "$oAvg ms" }
+    $oLoss = Get-Val $osrc 'loss'; $oTot = Get-Val $osrc 'totalPings'
+    $oLossStr = if ($oLoss -ne '数据缺失' -and $oTot -ne '数据缺失') { "$oLoss/$oTot" } else { '数据缺失' }
     Emit '  项目                 本机                       对方'
     $rows = @()
-    $rows += [pscustomobject]@{ K = '工具版本'; A = $facts.Version; B = "$($o.version)" }
-    $rows += [pscustomobject]@{ K = '生成时间'; A = $facts.Generated; B = "$($o.generated)" }
-    $rows += [pscustomobject]@{ K = '到对方延迟(平均)'; A = if ($facts.AvgMs) { "$($facts.AvgMs) ms" } else { '不可达' }; B = if ($o.avgMs) { "$($o.avgMs) ms" } else { '不可达' } }
-    $rows += [pscustomobject]@{ K = '丢包'; A = "$($facts.LossCount)/$($facts.TotalPings)"; B = "$($o.loss)/$($o.totalPings)" }
-    $rows += [pscustomobject]@{ K = '本机IPv6地址'; A = "$($facts.LocalV6)"; B = "$($o.localV6)" }
-    $rows += [pscustomobject]@{ K = 'IPv6外网连通'; A = "$($facts.V6ExtOk)"; B = "$($o.v6ExtOk)" }
-    $rows += [pscustomobject]@{ K = 'NAT类型'; A = $facts.NatType; B = $o.natType }
-    $rows += [pscustomobject]@{ K = 'CGNAT迹象'; A = "$($facts.IsCgnat)"; B = "$($o.isCgnat)" }
-    $rows += [pscustomobject]@{ K = '移动运营商'; A = "$($facts.IsMobileIsp)"; B = "$($o.isMobileIsp)" }
-    $rows += [pscustomobject]@{ K = '手机热点/共享'; A = "$($facts.Tether)"; B = "$($o.tether)" }
-    $rows += [pscustomobject]@{ K = '中继判定'; A = $facts.RelayVerdict; B = $o.relayVerdict }
+    $rows += [pscustomobject]@{ K = '工具版本'; A = $facts.Version; B = Get-Val $o 'version' }
+    $rows += [pscustomobject]@{ K = '生成时间'; A = $facts.Generated; B = Get-Val $o 'generated' }
+    $rows += [pscustomobject]@{ K = '到对方延迟(平均)'; A = if ($facts.AvgMs) { "$($facts.AvgMs) ms" } else { '不可达' }; B = $oAvg }
+    $rows += [pscustomobject]@{ K = '丢包'; A = "$($facts.LossCount)/$($facts.TotalPings)"; B = $oLossStr }
+    $rows += [pscustomobject]@{ K = '丢包判定'; A = $facts.LossVerdict; B = Get-Val $osrc 'lossVerdict' }
+    $rows += [pscustomobject]@{ K = '本机IPv6地址'; A = "$($facts.LocalV6)"; B = Get-Val $osrc 'localV6' }
+    $rows += [pscustomobject]@{ K = 'IPv6外网连通'; A = "$($facts.V6ExtOk)"; B = Get-Val $osrc 'v6ExtOk' }
+    $rows += [pscustomobject]@{ K = 'NAT类型'; A = $facts.NatType; B = Get-Val $osrc 'natType' }
+    $rows += [pscustomobject]@{ K = 'CGNAT迹象'; A = "$($facts.IsCgnat)"; B = Get-Val $osrc 'isCgnat' }
+    $rows += [pscustomobject]@{ K = '移动运营商'; A = "$($facts.IsMobileIsp)"; B = Get-Val $osrc 'isMobileIsp' }
+    $rows += [pscustomobject]@{ K = '手机热点/共享'; A = "$($facts.Tether)"; B = Get-Val $osrc 'tether' }
+    $rows += [pscustomobject]@{ K = '中继判定'; A = $facts.RelayVerdict; B = Get-Val $osrc 'relayVerdict' }
     foreach ($rw in $rows) { Emit ("  {0,-20} {1,-26} {2}" -f $rw.K, $rw.A, $rw.B) }
     Emit '  对照提示:'
-    if ("$($o.version)" -ne $facts.Version) { Warn '双方工具版本不一致, 请都升级到相同版本后再对照' }
-    if ($facts.AvgMs -and $o.avgMs -and [math]::Abs([double]$facts.AvgMs - [double]$o.avgMs) -gt 100) { Warn '双向延迟差异大 → 可能只有单方向异常(某一侧上行/打洞问题)' }
-    if ($facts.LocalV6 -ne [bool]$o.localV6) { Info '双方IPv6条件不一致 → IPv6直连可行性以两侧都满足为前提' }
-    if ($facts.NatType -eq 'PORT_VARYING' -or $o.natType -eq 'PORT_VARYING') { Warn '至少一侧为对称型NAT行为 → 直连打洞成功率低, 考虑中转方案' }
+    $oVer = Get-Val $o 'version'
+    if ($oVer -ne '数据缺失' -and $oVer -ne $facts.Version) { Warn '双方工具版本不一致, 请都升级到相同版本后再对照' }
+    $oAvgN = Get-Val $osrc 'avgMs'
+    if ($facts.AvgMs -and $oAvgN -ne '数据缺失' -and [math]::Abs([double]$facts.AvgMs - [double]$oAvgN) -gt 100) { Warn '双向延迟差异大 → 可能只有单方向异常(某一侧上行/打洞问题)' }
+    $oV6 = Get-Val $osrc 'localV6'
+    if ($oV6 -ne '数据缺失' -and $facts.LocalV6 -ne [bool]::Parse($oV6)) { Info '双方IPv6条件不一致 → IPv6直连可行性以两侧都满足为前提' }
+    $oNat = Get-Val $osrc 'natType'
+    if ($facts.NatType -eq 'PORT_VARYING' -or $oNat -eq 'PORT_VARYING') { Warn '至少一侧为对称型NAT行为 → 直连打洞成功率低, 考虑中转方案' }
 }
 
 if ($MyInvocation.InvocationName -ne '.') { Main }
+
+
+
+
 
 
