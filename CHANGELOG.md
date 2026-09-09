@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1] - 2026-09
+
+- 修复: PowerShell 7 下 Test-Connection 返回 `Latency`(无 `ResponseTime`) 导致延迟恒为 0、高延迟被误判"GOOD" → 新增 `Get-PingStats` 统一兼容两种接口, 并按成功状态统计丢包
+- 修复: `-Fix`/`-Undo` 状态文件路径的 `Join-Path (if ...)` 表达式语法错误 → 先计算目录变量
+- 修复: 重复 `-Fix` 覆盖旧状态记录 → `Merge-ChangeList` 合并并保留首次修改前的状态; `Expand-Changes` 防御性扁平化(修复撤销误删其他规则的嵌套数组问题)
+- 修复: `-Compare` 无法读取完整报告(facts 嵌套) → `ConvertTo-CompareSource` 归一化, 字段缺失显示"数据缺失"
+- 修复: STUN 解析接受截断报文 → 属性边界校验 + 事务 ID(TID) 校验, 异常数据不再进入 NAT 判断
+- 调整: 延迟与丢包分开评价(新增 lossVerdict: NONE/MILD/HEAVY), "2/10 丢包"不再显示为纯 GOOD
+- 测试: 47 项全绿; E2E 验证"修复 → 重复修复 → 撤销"全流程, 确认撤销只处理本工具改动、原有规则幸存
+
 ## [0.2.0] - 2026-09
 
 诊断可靠性(先修核心):
