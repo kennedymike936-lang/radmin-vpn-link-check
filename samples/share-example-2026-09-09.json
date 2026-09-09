@@ -1,0 +1,31 @@
+{
+    "tool": "NetCheck",
+    "version": "0.2.1",
+    "generated": "2026-09-09 22:05:12",
+    "peerIp": "26.99.x.x",
+    "avgMs": 219.9,
+    "minMs": 100,
+    "maxMs": 427,
+    "loss": 0,
+    "totalPings": 8,
+    "latencyVerdict": "FAIR",
+    "lossVerdict": "NONE",
+    "relayVerdict": "NONE",
+    "natType": "MULTI_EXIT",
+    "natReason": "不同出口IP(多线路/多层NAT), 直连行为不稳定",
+    "stunOk": 3,
+    "stunFail": 0,
+    "localV6": true,
+    "v6ExtOk": true,
+    "peerV6Ok": "",
+    "isCgnat": false,
+    "isMobileIsp": true,
+    "tether": false,
+    "uplinkType": "wifi",
+    "recommendations": [
+        "本机IPv6可用且外网连通, 但未检测朋友侧IPv6: 让朋友运行本工具并填写 -PeerIPv6 对照(依据: IPv6直连是成功率最高的路径, 需双方条件确认)",
+        "NAT实测为对称行为/多出口: 直连打洞成功率低, 优先选择带中转的方案(如 EasyTier 公共节点或 UU局域网)(依据: STUN实测映射行为)",
+        "检测到 CGNAT/移动大内网迹象: 中转类方案优先级高于纯打洞方案(依据: 100.64段/运营商信息)",
+        "第三方方案说明(如 UU局域网/EasyTier 免费政策)以官方页面为准, 核实于 2026-09"
+    ]
+}
