@@ -1,5 +1,5 @@
 ﻿<#
-  NetCheck v0.2.0 - 联机体检工具 (玩家向)
+  NetCheck v0.2.1 - 联机体检工具 (玩家向)
   ==========================================
   检测蓝盾(Radmin VPN)链路 + 网络环境(NAT/CGNAT/IPv6), 输出"现在怎样/依据/下一步"式报告。
   默认只读, 不修改任何系统设置。
@@ -604,6 +604,7 @@ function Invoke-Compare {
 }
 
 if ($MyInvocation.InvocationName -ne '.') { Main }
+
 
 
 
